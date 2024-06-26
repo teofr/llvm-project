@@ -79,9 +79,12 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Analysis/StackLifetime.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "tailcallelim"
+
+STATISTIC(NumTailAdded,  "Number of tail markers added.");
 
 STATISTIC(NumEliminated, "Number of tail calls removed");
 STATISTIC(NumRetDuped,   "Number of return duplicated");
@@ -102,6 +105,8 @@ static bool canTRE(Function &F) {
 
 namespace {
 struct AllocaDerivedValueTracker {
+  AllocaDerivedValueTracker(StackLifetime& SL) : SL(SL) {}
+
   // Start at a root value and walk its use-def chain to mark calls that use the
   // value or a derived value in AllocaUsers, and places where it may escape in
   // EscapePoints.
@@ -135,7 +140,7 @@ struct AllocaDerivedValueTracker {
           continue;
         bool IsNocapture =
             CB.isDataOperand(U) && CB.doesNotCapture(CB.getDataOperandNo(U));
-        callUsesLocalStack(CB, IsNocapture);
+        callUsesLocalStack(Root, CB, IsNocapture);
         if (IsNocapture) {
           // If the alloca-derived argument is passed in as nocapture, then it
           // can't propagate to the call's return. That would be capturing.
@@ -150,7 +155,7 @@ struct AllocaDerivedValueTracker {
       }
       case Instruction::Store: {
         if (U->getOperandNo() == 0)
-          EscapePoints.insert(I);
+          EscapePoints[Root].insert(I);
         continue;  // Stores have no users to analyze.
       }
       case Instruction::BitCast:
@@ -160,7 +165,7 @@ struct AllocaDerivedValueTracker {
       case Instruction::AddrSpaceCast:
         break;
       default:
-        EscapePoints.insert(I);
+        EscapePoints[Root].insert(I);
         break;
       }
 
@@ -168,9 +173,9 @@ struct AllocaDerivedValueTracker {
     }
   }
 
-  void callUsesLocalStack(CallBase &CB, bool IsNocapture) {
+  void callUsesLocalStack(Value* Root, CallBase &CB, bool IsNocapture) {
     // Add it to the list of alloca users.
-    AllocaUsers.insert(&CB);
+    AllocaUsers[Root].insert(&CB);
 
     // If it's nocapture then it can't capture this alloca.
     if (IsNocapture)
@@ -178,20 +183,29 @@ struct AllocaDerivedValueTracker {
 
     // If it can write to memory, it can leak the alloca value.
     if (!CB.onlyReadsMemory())
-      EscapePoints.insert(&CB);
+      EscapePoints[Root].insert(&CB);
   }
 
-  SmallPtrSet<Instruction *, 32> AllocaUsers;
-  SmallPtrSet<Instruction *, 32> EscapePoints;
+  StackLifetime& SL;
+  // We may need to index this by Alloca
+  DenseMap<Value*, SmallPtrSet<Instruction *, 32>> AllocaUsers;
+  DenseMap<Value*, SmallPtrSet<Instruction *, 32>> EscapePoints;
 };
 }
 
 static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
+  SmallVector<AllocaInst *, 64> Allocas;
+  for (auto &I : instructions(F))
+    if (auto *AI = dyn_cast<AllocaInst>(&I))
+      Allocas.push_back(AI);
+  StackLifetime SL(F, Allocas, StackLifetime::LivenessType::May);
+  SL.run();
+
   if (F.callsFunctionThatReturnsTwice())
     return false;
 
   // The local stack holds all alloca instructions and all byval arguments.
-  AllocaDerivedValueTracker Tracker;
+  AllocaDerivedValueTracker Tracker(SL);
   for (Argument &Arg : F.args()) {
     if (Arg.hasByValAttr())
       Tracker.walk(&Arg);
@@ -207,12 +221,17 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
   // Track whether a block is reachable after an alloca has escaped. Blocks that
   // contain the escaping instruction will be marked as being visited without an
   // escaped alloca, since that is how the block began.
-  enum VisitType {
-    UNVISITED,
-    UNESCAPED,
-    ESCAPED
-  };
-  DenseMap<BasicBlock *, VisitType> Visited;
+  // enum VisitType {
+  //   // UNVISITED,
+  //   UNESCAPED,
+  //   ESCAPED
+  // };
+
+  // Track how a given block starts per alloca
+  // For a bloc BB, EscapedMap[BB] has the Value* that may be escaped coming in
+  DenseMap<BasicBlock *, DenseSet<Value*>> EscapedMap;
+
+  // DenseSet<BasicBlock*> VisitedBB;
 
   // We propagate the fact that an alloca has escaped from block to successor.
   // Visit the blocks that are propagating the escapedness first. To do this, we
@@ -226,14 +245,55 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
   // statically use an alloca via use-def chain analysis, but may find an alloca
   // through other means if the block turns out to be reachable after an escape
   // point.
-  SmallVector<CallInst *, 32> DeferredTails;
+  DenseSet<CallInst *> DeferredTails;
 
-  BasicBlock *BB = &F.getEntryBlock();
-  VisitType Escaped = UNESCAPED;
-  do {
+  WorklistUnescaped.push_back(&F.getEntryBlock());
+  // Internally for every Block
+  // do {
+  while (!WorklistUnescaped.empty() || !WorklistEscaped.empty()) {
+    BasicBlock *BB;
+
+    if (!WorklistEscaped.empty()) {
+      BB = WorklistEscaped.pop_back_val();
+    } else {
+      BB = nullptr;
+      while (!WorklistUnescaped.empty()) {
+        auto *NextBB = WorklistUnescaped.pop_back_val();
+        if (EscapedMap[NextBB].empty()) {
+          BB = NextBB;
+          // Escaped = UNESCAPED;
+          break;
+        }
+      }
+    }
+
+    if (!BB) {
+      break;
+    }
+
+    // Copying it seems bad, we'll see
+    DenseSet<Value*> EscapedMapByAlloca = EscapedMap[BB];
+
+
     for (auto &I : *BB) {
-      if (Tracker.EscapePoints.count(&I))
-        Escaped = ESCAPED;
+
+      // Does any escape point happens at this instruction?
+      for (auto& It : Tracker.EscapePoints) {
+        int count = 0;
+        if (AllocaInst *AI = dyn_cast<AllocaInst>(It.getFirst())) {
+          // This after may be wrong
+          if (SL.isAliveAfter(AI, &I)) {
+            count += It.getSecond().count(&I);
+          }
+        } else {
+          count += It.getSecond().count(&I);
+        }
+        if (count){
+          EscapedMapByAlloca.insert(It.getFirst());
+        }
+      }
+
+      // Somewhere here we need to unescape dead things
 
       CallInst *CI = dyn_cast<CallInst>(&I);
       // A PseudoProbeInst has the IntrInaccessibleMemOnly tag hence it is
@@ -281,50 +341,81 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
                    << "marked as tail call candidate (readnone)";
           });
           CI->setTailCall();
+          ++NumTailAdded;
           Modified = true;
           continue;
         }
       }
 
-      if (!IsNoTail && Escaped == UNESCAPED && !Tracker.AllocaUsers.count(CI))
-        DeferredTails.push_back(CI);
+      int count2 = 0;
+      for (auto& It : Tracker.AllocaUsers) {
+        count2 += It.getSecond().count(CI);
+      }
+
+      // VisitType Escaped = UNESCAPED;
+      // for (auto& It : EscapedMapByAlloca) {
+      //   if (It.getSecond() > Escaped) {
+      //     Escaped = It.getSecond();
+      //   }
+      // }
+
+      // if there's no escape up to here, it may be good tail call
+      if (!IsNoTail && EscapedMapByAlloca.empty() && !count2) {
+        DeferredTails.insert(CI);
+      } else {
+        // If it's there, it means that at some run it wasnt escaped and now it
+        // is, the other variables don't change at every iteration
+        DeferredTails.erase(CI);
+      }
+
+      // unescape dead things, I guess
+      for (auto& It : EscapedMapByAlloca) {
+        if (AllocaInst *AI = dyn_cast<AllocaInst>(It)) {
+          if (!SL.isAliveAfter(AI, &I)) {
+            EscapedMapByAlloca.erase(AI);
+          }
+        }
+
+      }
     }
 
+    // VisitType Escaped = UNESCAPED;
+    // for (auto& It : EscapedMapByAlloca) {
+    //   if (It.getSecond() > Escaped) {
+    //     Escaped = It.getSecond();
+    //   }
+    // }
+
+
+
     for (auto *SuccBB : successors(BB)) {
-      auto &State = Visited[SuccBB];
-      if (State < Escaped) {
-        State = Escaped;
-        if (State == ESCAPED)
+      auto &State = EscapedMap[SuccBB];
+      bool changed = false;
+      for (auto It : EscapedMapByAlloca) {
+        changed |= std::get<1>(State.insert(It));;
+      }
+      if (changed) {
+        if (!State.empty())
           WorklistEscaped.push_back(SuccBB);
         else
           WorklistUnescaped.push_back(SuccBB);
       }
     }
 
-    if (!WorklistEscaped.empty()) {
-      BB = WorklistEscaped.pop_back_val();
-      Escaped = ESCAPED;
-    } else {
-      BB = nullptr;
-      while (!WorklistUnescaped.empty()) {
-        auto *NextBB = WorklistUnescaped.pop_back_val();
-        if (Visited[NextBB] == UNESCAPED) {
-          BB = NextBB;
-          Escaped = UNESCAPED;
-          break;
-        }
-      }
-    }
-  } while (BB);
 
+  };
+
+  // TODO instead of deferredTails, we need a set of non tail calls, and then
+  // mark every other
   for (CallInst *CI : DeferredTails) {
-    if (Visited[CI->getParent()] != ESCAPED) {
+    // if (Visited[CI->getParent()] != ESCAPED) {
       // If the escape point was part way through the block, calls after the
       // escape point wouldn't have been put into DeferredTails.
       LLVM_DEBUG(dbgs() << "Marked as tail call candidate: " << *CI << "\n");
       CI->setTailCall();
+      ++NumTailAdded;
       Modified = true;
-    }
+    // }
   }
 
   return Modified;
