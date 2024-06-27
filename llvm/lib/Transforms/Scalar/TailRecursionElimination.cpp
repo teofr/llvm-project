@@ -85,7 +85,6 @@ using namespace llvm;
 #define DEBUG_TYPE "tailcallelim"
 
 STATISTIC(NumTailAdded,  "Number of tail markers added.");
-
 STATISTIC(NumEliminated, "Number of tail calls removed");
 STATISTIC(NumRetDuped,   "Number of return duplicated");
 STATISTIC(NumAccumAdded, "Number of accumulators introduced");
@@ -105,8 +104,6 @@ static bool canTRE(Function &F) {
 
 namespace {
 struct AllocaDerivedValueTracker {
-  AllocaDerivedValueTracker(StackLifetime& SL) : SL(SL) {}
-
   // Start at a root value and walk its use-def chain to mark calls that use the
   // value or a derived value in AllocaUsers, and places where it may escape in
   // EscapePoints.
@@ -186,7 +183,6 @@ struct AllocaDerivedValueTracker {
       EscapePoints[Root].insert(&CB);
   }
 
-  StackLifetime& SL;
   // We may need to index this by Alloca
   DenseMap<Value*, SmallPtrSet<Instruction *, 32>> AllocaUsers;
   DenseMap<Value*, SmallPtrSet<Instruction *, 32>> EscapePoints;
@@ -205,7 +201,7 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
     return false;
 
   // The local stack holds all alloca instructions and all byval arguments.
-  AllocaDerivedValueTracker Tracker(SL);
+  AllocaDerivedValueTracker Tracker;
   for (Argument &Arg : F.args()) {
     if (Arg.hasByValAttr())
       Tracker.walk(&Arg);
@@ -230,6 +226,9 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
   // Track how a given block starts per alloca
   // For a bloc BB, EscapedMap[BB] has the Value* that may be escaped coming in
   DenseMap<BasicBlock *, DenseSet<Value*>> EscapedMap;
+
+  // Just so everything is visited at least once
+  DenseSet<BasicBlock*> Visited;
 
   // DenseSet<BasicBlock*> VisitedBB;
 
@@ -270,6 +269,8 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
     if (!BB) {
       break;
     }
+
+    Visited.insert(BB);
 
     // Copying it seems bad, we'll see
     DenseSet<Value*> EscapedMapByAlloca = EscapedMap[BB];
@@ -394,7 +395,7 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
       for (auto It : EscapedMapByAlloca) {
         changed |= std::get<1>(State.insert(It));;
       }
-      if (changed) {
+      if (changed || !Visited.count(SuccBB)) {
         if (!State.empty())
           WorklistEscaped.push_back(SuccBB);
         else
