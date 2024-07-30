@@ -104,10 +104,21 @@ static bool canTRE(Function &F) {
 
 namespace {
 struct AllocaDerivedValueTracker {
+  AllocaDerivedValueTracker(SmallVector<Value*> values) {
+    unsigned count = 0;
+    for (auto& v : values) {
+      AllocaToIdx[v] = count++;
+    }
+
+    for (auto& vi : AllocaToIdx){
+      walk(vi.first, vi.second);
+    }
+  }
+
   // Start at a root value and walk its use-def chain to mark calls that use the
   // value or a derived value in AllocaUsers, and places where it may escape in
   // EscapePoints.
-  void walk(Value *Root) {
+  void walk(Value *Root, unsigned id) {
     SmallVector<Use *, 32> Worklist;
     SmallPtrSet<Use *, 32> Visited;
 
@@ -137,7 +148,7 @@ struct AllocaDerivedValueTracker {
           continue;
         bool IsNocapture =
             CB.isDataOperand(U) && CB.doesNotCapture(CB.getDataOperandNo(U));
-        callUsesLocalStack(Root, CB, IsNocapture);
+        callUsesLocalStack(id, CB, IsNocapture);
         if (IsNocapture) {
           // If the alloca-derived argument is passed in as nocapture, then it
           // can't propagate to the call's return. That would be capturing.
@@ -151,8 +162,10 @@ struct AllocaDerivedValueTracker {
         continue;
       }
       case Instruction::Store: {
-        if (U->getOperandNo() == 0)
-          EscapePoints[Root].insert(I);
+        if (U->getOperandNo() == 0){
+          EscapePoints.resize(AllocaToIdx.size());
+          EscapePoints[I].set(id);
+        }
         continue;  // Stores have no users to analyze.
       }
       case Instruction::BitCast:
@@ -162,7 +175,8 @@ struct AllocaDerivedValueTracker {
       case Instruction::AddrSpaceCast:
         break;
       default:
-        EscapePoints[Root].insert(I);
+        EscapePoints.resize(AllocaToIdx.size());
+        EscapePoints[I].set(id);
         break;
       }
 
@@ -170,47 +184,52 @@ struct AllocaDerivedValueTracker {
     }
   }
 
-  void callUsesLocalStack(Value* Root, CallBase &CB, bool IsNocapture) {
+  void callUsesLocalStack(unsigned id, CallBase &CB, bool IsNocapture) {
     // Add it to the list of alloca users.
-    AllocaUsers[Root].insert(&CB);
+    AllocaUsers.resize(AllocaToIdx.size());
+    AllocaUsers[&CB].set(id);
 
     // If it's nocapture then it can't capture this alloca.
     if (IsNocapture)
       return;
 
     // If it can write to memory, it can leak the alloca value.
-    if (!CB.onlyReadsMemory())
-      EscapePoints[Root].insert(&CB);
+    if (!CB.onlyReadsMemory()) {
+      EscapePoints.resize(AllocaToIdx.size());
+      EscapePoints[&CB].set(id);
+    }
   }
 
   // We may need to index this by Alloca
-  DenseMap<Value*, SmallPtrSet<Instruction *, 32>> AllocaUsers;
-  DenseMap<Value*, SmallPtrSet<Instruction *, 32>> EscapePoints;
+  DenseMap<Instruction *, BitVector> AllocaUsers;
+  DenseMap<Instruction *, BitVector> EscapePoints;
+
+  DenseMap<Value *, unsigned> AllocaToIdx;
 };
 }
 
 static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
-  SmallVector<AllocaInst *, 64> Allocas;
-  for (auto &I : instructions(F))
-    if (auto *AI = dyn_cast<AllocaInst>(&I))
-      Allocas.push_back(AI);
-  StackLifetime SL(F, Allocas, StackLifetime::LivenessType::May);
-  SL.run();
-
   if (F.callsFunctionThatReturnsTwice())
     return false;
 
-  // The local stack holds all alloca instructions and all byval arguments.
-  AllocaDerivedValueTracker Tracker;
+  SmallVector<AllocaInst *, 64> Allocas;
+  SmallVector<Value*> values;
+  for (auto &I : instructions(F)){
+    if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+      Allocas.push_back(AI);
+      values.push_back(AI);
+    }
+  }
+  StackLifetime SL(F, Allocas, StackLifetime::LivenessType::May);
+  SL.run();
+
   for (Argument &Arg : F.args()) {
     if (Arg.hasByValAttr())
-      Tracker.walk(&Arg);
+      values.push_back(&Arg);
   }
-  for (auto &BB : F) {
-    for (auto &I : BB)
-      if (AllocaInst *AI = dyn_cast<AllocaInst>(&I))
-        Tracker.walk(AI);
-  }
+
+  // The local stack holds all alloca instructions and all byval arguments.
+  AllocaDerivedValueTracker Tracker(values);
 
   bool Modified = false;
 
@@ -225,7 +244,7 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
 
   // Track how a given block starts per alloca
   // For a bloc BB, EscapedMap[BB] has the Value* that may be escaped coming in
-  DenseMap<BasicBlock *, DenseSet<Value*>> EscapedMap;
+  DenseMap<BasicBlock *, BitVector> EscapedMap;
 
   // Just so everything is visited at least once
   DenseSet<BasicBlock*> Visited;
@@ -273,26 +292,31 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
     Visited.insert(BB);
 
     // Copying it seems bad, we'll see
-    DenseSet<Value*> EscapedMapByAlloca = EscapedMap[BB];
-
+    BitVector EscapedMapByAlloca = EscapedMap[BB];
+    EscapedMapByAlloca.resize(Tracker.AllocaToIdx.size());
 
     for (auto &I : *BB) {
-
       // Does any escape point happens at this instruction?
-      for (auto& It : Tracker.EscapePoints) {
-        int count = 0;
-        if (AllocaInst *AI = dyn_cast<AllocaInst>(It.getFirst())) {
-          // This after may be wrong
-          if (SL.isAliveAfter(AI, &I)) {
-            count += It.getSecond().count(&I);
-          }
-        } else {
-          count += It.getSecond().count(&I);
-        }
-        if (count){
-          EscapedMapByAlloca.insert(It.getFirst());
-        }
+      auot& escaped = Tracker.EscapePoints[&I];
+      if (escaped.any()) {
+          EscapedMapByAlloca |= escaped;
+          // What about dead things??
       }
+
+      // for (auto& It : Tracker.EscapePoints) {
+      //   int count = 0;
+      //   if (AllocaInst *AI = dyn_cast<AllocaInst>(It.getFirst())) {
+      //     // This after may be wrong
+      //     if (SL.isAliveAfter(AI, &I)) {
+      //       count += It.getSecond().count(&I);
+      //     }
+      //   } else {
+      //     count += It.getSecond().count(&I);
+      //   }
+      //   if (count){
+      //     EscapedMapByAlloca.insert(It.getFirst());
+      //   }
+      // }
 
       // Somewhere here we need to unescape dead things
 
@@ -391,6 +415,7 @@ static bool markTails(Function &F, OptimizationRemarkEmitter *ORE) {
 
     for (auto *SuccBB : successors(BB)) {
       auto &State = EscapedMap[SuccBB];
+      State.resize(Tracker.AllocaToIdx.size());
       bool changed = false;
       for (auto It : EscapedMapByAlloca) {
         changed |= std::get<1>(State.insert(It));;
